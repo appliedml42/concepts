@@ -1,3 +1,0 @@
-[submodule "LLMs"]
-	path = LLMs
-	url = https://github.com/appliedml42/LLMs.git
