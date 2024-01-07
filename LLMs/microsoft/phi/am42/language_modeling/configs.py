@@ -15,7 +15,7 @@ class TrainingConfig:
     batch_size: int
     learning_rate: float
     weight_decay: float
-    warmup: int
+    warmup: bool
     num_epochs: int
     batch_size: int
     micro_batch_size: int
@@ -84,7 +84,7 @@ train_devo = {
     "chat_template": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}",
     "learning_rate": 3e-3,
     "weight_decay": 0.02,
-    "warmup": 1000,
+    "warmup": True,
     "num_epochs": 1,
     "batch_size": 128,
     "micro_batch_size": 8,

@@ -21,6 +21,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase as HFTo
 class RunConfig:
     model_config: ModelConfig
     training_config: TrainingConfig
+    warmup_steps: int
 
 
 def setup(
@@ -162,9 +163,13 @@ def train(
         throughput = Throughput(window_size=50)
 
     step_count = 0
-    iter_num = 1
+    iter_num = 0
     total_t0 = time.perf_counter()
     total_lengths = 0
+    if training_config.warmup:
+        warmup_steps = 2 * len(train_dl) // training_config.gradient_accumulation_iters
+    else:
+        warmup_steps = -1
 
     if fabric.local_rank == 0:
         inner_pbar = tqdm(
@@ -178,7 +183,7 @@ def train(
         for input_ids, attn_mask in train_dl:
             iter_t0 = time.perf_counter()
 
-            if step_count <= training_config.warmup:
+            if step_count <= warmup_steps:
                 lr = training_config.learning_rate * step_count / training_config.warmup
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
