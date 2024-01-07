@@ -2,6 +2,37 @@ from dataclasses import dataclass
 
 
 @dataclass
+class DatasetConfig:
+    name: str
+    percent: float
+    split: str
+
+
+@dataclass
+class TrainingConfig:
+    train_datasets: list[DatasetConfig]
+    chat_template: str
+    batch_size: int
+    learning_rate: float
+    weight_decay: float
+    warmup: int
+    num_epochs: int
+    batch_size: int
+    micro_batch_size: int
+    gradient_accumulation_iters: float = -1.0
+
+    @staticmethod
+    def get_config(train_config: str):
+        if train_config == "train_devo":
+            return TrainingConfig(**train_devo)
+        else:
+            raise ValueError(f"Unknown train_config: {train_config}")
+
+    def __post_init__(self):
+        self.gradient_accumulation_iters = self.batch_size // self.micro_batch_size
+
+
+@dataclass
 class ModelConfig:
     hf_repo_id: str
     block_size: int
@@ -46,4 +77,15 @@ Phi1_5 = {
     "intermediate_size": 8192,
     "rope_base": 10000,
     "head_size": 64,
+}
+
+train_devo = {
+    "train_datasets": [DatasetConfig("HuggingFaceH4/ultrachat_200k", 1.0, "train_sft")],
+    "chat_template": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}",
+    "learning_rate": 3e-3,
+    "weight_decay": 0.02,
+    "warmup": 1000,
+    "num_epochs": 1,
+    "batch_size": 128,
+    "micro_batch_size": 8,
 }

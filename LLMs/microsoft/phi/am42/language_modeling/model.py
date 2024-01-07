@@ -56,13 +56,19 @@ class SLM(nn.Module):
                 1, 1, max_seq_length, max_seq_length
             )
 
-    def forward(self, idx: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
-        T = idx.size(1)
-        cos = self.cos.index_select(0, input_pos)
-        sin = self.sin.index_select(0, input_pos)
-
-        assert self.mask_cache is not None
-        mask = self.mask_cache.index_select(2, input_pos)
+    def forward(
+        self, idx: torch.Tensor, input_pos: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if input_pos is None:
+            T = idx.size(1)
+            cos = self.cos[:T]
+            sin = self.sin[:T]
+            mask = None
+        else:
+            cos = self.cos.index_select(0, input_pos)
+            sin = self.sin.index_select(0, input_pos)
+            assert self.mask_cache is not None
+            mask = self.mask_cache.index_select(2, input_pos)
 
         x = self.transformer.wte(idx)
         for block in self.transformer.h:
