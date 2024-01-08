@@ -3,7 +3,9 @@ import time
 from dataclasses import dataclass
 
 import lightning as L
+import names
 import torch
+import wandb
 from configs import DatasetConfig, ModelConfig, TrainingConfig
 from datasets import concatenate_datasets, load_dataset
 from jsonargparse import CLI
@@ -19,9 +21,15 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase as HFTo
 
 @dataclass
 class RunConfig:
-    model_config: ModelConfig
-    training_config: TrainingConfig
-    warmup_steps: int
+    model_name: str
+    train_config: str
+    cache_dir: str
+    ckpt_dir: str
+    num_proc: int
+    num_devices: int
+    precision: str
+    run_dir: str
+    run_name: str
 
 
 def setup(
@@ -29,10 +37,15 @@ def setup(
     train_config: str,
     cache_dir: str = "/workspace/downloads/huggingface",
     ckpt_dir: str = "/workspace/concepts/LLMs/microsoft/phi/checkpoints",
+    experiment_dir: str = "/workspace/concepts/LLMs/microsoft/phi/experiments",
     num_proc: int = 32,
     num_devices: int = 1,
     precision: str = "bf16-mixed",
 ):
+    run_name = names.get_full_name().replace(" ", "_")
+    run_dir = os.path.join(experiment_dir, run_name)
+    os.makedirs(run_dir)
+
     if num_devices > 1:
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
@@ -45,7 +58,18 @@ def setup(
         strategy = "auto"
 
     fabric = L.Fabric(devices=num_devices, strategy=strategy, precision=precision)
-    fabric.launch(main, model_name, train_config, cache_dir, ckpt_dir, num_proc)
+    run_config = RunConfig(
+        model_name=model_name,
+        train_config=train_config,
+        cache_dir=cache_dir,
+        ckpt_dir=ckpt_dir,
+        num_proc=num_proc,
+        num_devices=num_devices,
+        precision=precision,
+        run_dir=run_dir,
+        run_name=run_name,
+    )
+    fabric.launch(main, run_config)
 
 
 def get_tokenizer(model_name: str, ckpt_dir: str, chat_template: str):
@@ -155,36 +179,54 @@ def train(
     training_config: TrainingConfig,
     model: SLM,
     optimizer: torch.optim.Optimizer,
+    run_dir: str,
+    run_name: str,
     train_dl: DataLoader,
-    train_sampler: DistributedSampler | None = None,
     valid_dl: DataLoader | None = None,
 ):
-    if fabric.local_rank == 0:
-        throughput = Throughput(window_size=50)
+    throughput = Throughput(world_size=fabric.world_size, window_size=100)
 
-    step_count = 0
-    iter_num = 0
-    total_t0 = time.perf_counter()
-    total_lengths = 0
+    total_iters = training_config.num_epochs * len(train_dl)
+    total_steps = total_iters // training_config.gradient_accumulation_iters
+
     if training_config.warmup:
-        warmup_steps = 2 * len(train_dl) // training_config.gradient_accumulation_iters
+        warmup_steps = int(0.1 * total_steps)
     else:
         warmup_steps = -1
 
     if fabric.local_rank == 0:
         inner_pbar = tqdm(
-            range(training_config.num_epochs * len(train_dl)),
+            range(total_iters),
             colour="green",
         )
 
+        wandb.login()
+        config = dict()
+        config.update(training_config.__dict__)
+        config.update(model.config.__dict__)
+        config["warmup_steps"] = warmup_steps
+
+        wandb.init(
+            project="Small Language Models",
+            name=run_name,
+            dir=run_dir,
+            config=config,
+            tags=[model.config.hf_repo_id, "full", "sft"],
+        )
+
+    step_count = 0
+    iter_num = 0
+    total_t0 = time.perf_counter()
+    total_lengths = 0
+
     for epoch in range(training_config.num_epochs):
-        train_sampler.set_epoch(epoch) if train_sampler is not None else None
+        train_dl.sampler.set_epoch(epoch) if train_dl.sampler is not None else None  # type: ignore
 
         for input_ids, attn_mask in train_dl:
             iter_t0 = time.perf_counter()
 
             if step_count <= warmup_steps:
-                lr = training_config.learning_rate * step_count / training_config.warmup
+                lr = training_config.learning_rate * step_count / warmup_steps
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
@@ -217,12 +259,11 @@ def train(
 
             if fabric.local_rank == 0:
                 inner_pbar.update(1)  # type: ignore
-                inner_pbar.set_description(f"Epoch {epoch}")  # type: ignore
+                inner_pbar.set_description(  # type: ignore
+                    f"epoch {epoch}/{training_config.num_epochs} step {step_count}/{total_steps} accumulating {is_accumulating}"
+                )
 
-            if (
-                iter_num % training_config.gradient_accumulation_iters == 0
-                and fabric.local_rank == 0
-            ):
+            if not is_accumulating and fabric.local_rank == 0:
                 loss_item = loss.item()
                 t1 = time.perf_counter()
                 throughput.update(  # type: ignore
@@ -231,40 +272,37 @@ def train(
                     samples=iter_num * training_config.micro_batch_size,
                     lengths=total_lengths,
                 )
-                metrics = throughput.compute()  # type: ignore
 
-                print(metrics)
-
-                print(
-                    f"iter {iter_num} step {step_count}: loss {loss_item:.4f}, iter time:"
-                    f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
-                )
+                metrics = {}
+                for key, value in throughput.compute().items():
+                    metrics[f"train/{key}"] = value
+                metrics["train/loss"] = loss_item
+                metrics["train/learning_rate"] = optimizer.param_groups[0]["lr"]
+                wandb.log(metrics, step=step_count, commit=True)
 
             iter_num += 1
+    if fabric.local_rank == 0:
+        wandb.finish()
+        inner_pbar.close()  # type: ignore
 
 
-def main(
-    fabric: L.Fabric,
-    model_name: str,
-    train_config: str,
-    cache_dir: str,
-    ckpt_dir: str,
-    num_proc: int = 32,
-):
-    _train_config = TrainingConfig.get_config(train_config)
-    tokenizer = get_tokenizer(model_name, ckpt_dir, _train_config.chat_template)
+def main(fabric: L.Fabric, run_config: RunConfig):
+    _train_config = TrainingConfig.get_config(run_config.train_config)
+    tokenizer = get_tokenizer(
+        run_config.model_name, run_config.ckpt_dir, _train_config.chat_template
+    )
 
     train_dl = configure_dataloaders(
         _train_config.train_datasets,
-        cache_dir,
-        num_proc=num_proc,
+        run_config.cache_dir,
+        num_proc=run_config.num_proc,
         shuffle=True,
         tokenizer=tokenizer,
         fabric=fabric,
         micro_batch_size=_train_config.micro_batch_size,
     )
 
-    model = get_model(model_name, ckpt_dir, fabric)
+    model = get_model(run_config.model_name, run_config.ckpt_dir, fabric)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -274,7 +312,16 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
     fabric.seed_everything(42)
 
-    train(fabric, _train_config, model, optimizer, train_dl, None)  # type: ignore
+    train(
+        fabric=fabric,
+        training_config=_train_config,
+        model=model,  # type: ignore
+        optimizer=optimizer,  # type: ignore
+        train_dl=train_dl,
+        valid_dl=None,
+        run_dir=run_config.run_dir,
+        run_name=run_config.run_name,
+    )
 
 
 if __name__ == "__main__":
