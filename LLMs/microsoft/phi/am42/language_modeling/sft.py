@@ -6,14 +6,14 @@ import lightning as L
 import names
 import torch
 import wandb
-from configs import DatasetConfig, ModelConfig, TrainingConfig
+from configs import AdamConfig, AdamWConfig, DatasetConfig, ModelConfig, TrainingConfig
 from datasets import concatenate_datasets, load_dataset
-from jsonargparse import CLI
+from jsonargparse import ActionConfigFile, ArgumentParser
 from lightning.fabric.strategies import FSDPStrategy  # type: ignore
-from lightning.fabric.utilities.throughput import Throughput
 from model import SLM, Block
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchmetrics import RunningMean
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase as HFTokenizer
@@ -32,19 +32,21 @@ class RunConfig:
     run_name: str
 
 
-def setup(
-    model_name: str,
-    train_config: str,
-    cache_dir: str = "/workspace/downloads/huggingface",
-    ckpt_dir: str = "/workspace/concepts/LLMs/microsoft/phi/checkpoints",
-    experiment_dir: str = "/workspace/concepts/LLMs/microsoft/phi/experiments",
-    num_proc: int = 32,
-    num_devices: int = 1,
-    precision: str = "bf16-mixed",
-):
-    run_name = names.get_full_name().replace(" ", "_")
+def setup(parser: ArgumentParser):
+    args = parser.parse_args()
+
+    model_name = args.model_name
+    train_config = args.train_config
+    cache_dir = args.cache_dir
+    ckpt_dir = args.ckpt_dir
+    experiment_dir = args.experiment_dir
+    run_name = args.run_name
+    num_proc: int = args.num_proc
+    num_devices: int = args.num_devices
+    precision = args.precision
+
+    run_name = names.get_full_name().replace(" ", "_") if run_name is None else run_name
     run_dir = os.path.join(experiment_dir, run_name)
-    os.makedirs(run_dir)
 
     if num_devices > 1:
         strategy = FSDPStrategy(
@@ -58,6 +60,13 @@ def setup(
         strategy = "auto"
 
     fabric = L.Fabric(devices=num_devices, strategy=strategy, precision=precision)
+    if fabric.local_rank == 0 and not os.path.exists(run_dir):
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "args.yaml"), "w") as f:
+            f.write(parser.dump(args))
+
+    L.Fabric.seed_everything(42 + fabric.local_rank * 7)
+
     run_config = RunConfig(
         model_name=model_name,
         train_config=train_config,
@@ -69,7 +78,7 @@ def setup(
         run_dir=run_dir,
         run_name=run_name,
     )
-    fabric.launch(main, run_config)
+    fabric.launch(main, run_config)  # type: ignore
 
 
 def get_tokenizer(model_name: str, ckpt_dir: str, chat_template: str):
@@ -85,12 +94,9 @@ def get_tokenizer(model_name: str, ckpt_dir: str, chat_template: str):
     return tokenizer
 
 
-def loss_fn(logits, labels, mask):
-    return (
-        torch.nn.functional.cross_entropy(logits, labels, reduction="none")
-        .masked_fill(~mask, 0.0)
-        .mean()
-    )
+def loss_fn(logits: torch.Tensor, labels, mask):
+    labels = labels.masked_fill(~mask, -100)
+    return torch.nn.functional.cross_entropy(logits, labels)
 
 
 def configure_dataloaders(
@@ -101,6 +107,7 @@ def configure_dataloaders(
     tokenizer: HFTokenizer,
     micro_batch_size: int,
     fabric: L.Fabric,
+    use_distributed_sampler: bool = True,
 ):
     datasets = []
     for dataset_config in dataset_configs:
@@ -126,7 +133,7 @@ def configure_dataloaders(
             num_replicas=fabric.world_size,
             shuffle=shuffle,
         )
-        if fabric.world_size > 1
+        if fabric.world_size > 1 and use_distributed_sampler
         else None
     )
 
@@ -155,22 +162,21 @@ def configure_dataloaders(
     )
 
 
-def get_model(model_name: str, ckpt_dir: str, fabric: L.Fabric):
+def get_model(model_name: str, ckpt_dir: str, run_dir: str, fabric: L.Fabric):
     config: ModelConfig = ModelConfig.get_config(model_name)
-    model = SLM(config)
-    model = fabric.setup_module(model)  # type: ignore
+    finetuned_model_path = os.path.join(run_dir, "model.pt")
     checkpoint_path = os.path.join(ckpt_dir, model_name, "am42_pytorch_model.bin")
 
-    if isinstance(fabric.strategy, FSDPStrategy):
-        fabric.load_raw(checkpoint_path, model, strict=True)
+    with fabric.init_module(empty_init=fabric.world_size > 1):
+        model = SLM(config)
+    model = torch.compile(model)
+    model = fabric.setup_module(model)  # type: ignore
+    if os.path.exists(finetuned_model_path):
+        print(f"Loading finetuned model from {finetuned_model_path}")
+        fabric.load(finetuned_model_path, {"model": model})
     else:
-        checkpoint = torch.load(
-            checkpoint_path,
-            mmap=True,
-            weights_only=True,
-        )
-        model.load_state_dict(checkpoint, assign=True)
-
+        print(f"Loading model from {checkpoint_path}")
+        fabric.load_raw(checkpoint_path, model, strict=True)
     return model
 
 
@@ -182,17 +188,24 @@ def train(
     run_dir: str,
     run_name: str,
     train_dl: DataLoader,
-    valid_dl: DataLoader | None = None,
+    tokenizer: HFTokenizer,
+    val_dl: DataLoader | None = None,
 ):
-    throughput = Throughput(world_size=fabric.world_size, window_size=100)
-
     total_iters = training_config.num_epochs * len(train_dl)
-    total_steps = total_iters // training_config.gradient_accumulation_iters
+    total_steps = int(total_iters // training_config.gradient_accumulation_iters)
 
-    if training_config.warmup:
-        warmup_steps = int(0.1 * total_steps)
-    else:
-        warmup_steps = -1
+    warmup_steps = int(0.1 * total_steps)
+    scheduler1 = torch.optim.lr_scheduler.LambdaLR(
+        optimizer=optimizer, lr_lambda=lambda step: step / warmup_steps
+    )
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer=optimizer, T_max=total_steps - warmup_steps
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer=optimizer,
+        schedulers=[scheduler1, scheduler2],
+        milestones=[warmup_steps],
+    )
 
     if fabric.local_rank == 0:
         inner_pbar = tqdm(
@@ -211,24 +224,22 @@ def train(
             name=run_name,
             dir=run_dir,
             config=config,
-            tags=[model.config.hf_repo_id, "full", "sft"],
+            tags=[model.config.hf_repo_id, "full", "sft", "using_torch_compile"],
         )
 
-    step_count = 0
+    update_step = 0
     iter_num = 0
-    total_t0 = time.perf_counter()
-    total_lengths = 0
+
+    running_loss = RunningMean(
+        window=int(training_config.gradient_accumulation_iters), sync_on_compute=False
+    ).to(fabric.device)
 
     for epoch in range(training_config.num_epochs):
-        train_dl.sampler.set_epoch(epoch) if train_dl.sampler is not None else None  # type: ignore
+        if fabric.world_size > 1:
+            train_dl.sampler.set_epoch(epoch)  # type: ignore
 
         for input_ids, attn_mask in train_dl:
-            iter_t0 = time.perf_counter()
-
-            if step_count <= warmup_steps:
-                lr = training_config.learning_rate * step_count / warmup_steps
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
+            iter_t_start = time.perf_counter()
 
             is_accumulating = (
                 iter_num % training_config.gradient_accumulation_iters != 0
@@ -241,7 +252,6 @@ def train(
             y = y.reshape(-1)
             y = fabric.to_device(y.pin_memory())
 
-            total_lengths += int(torch.sum(attn_mask).item())
             mask = attn_mask[:, 1:]
             mask = mask.reshape(-1).bool()
             mask = fabric.to_device(mask.pin_memory())
@@ -255,35 +265,114 @@ def train(
             if not is_accumulating:
                 optimizer.step()
                 optimizer.zero_grad()
-                step_count += 1
+                scheduler.step()
+                update_step += 1
 
-            if fabric.local_rank == 0:
-                inner_pbar.update(1)  # type: ignore
-                inner_pbar.set_description(  # type: ignore
-                    f"epoch {epoch}/{training_config.num_epochs} step {step_count}/{total_steps} accumulating {is_accumulating}"
-                )
-
-            if not is_accumulating and fabric.local_rank == 0:
-                loss_item = loss.item()
-                t1 = time.perf_counter()
-                throughput.update(  # type: ignore
-                    time=t1 - total_t0,
-                    batches=iter_num,
-                    samples=iter_num * training_config.micro_batch_size,
-                    lengths=total_lengths,
-                )
-
-                metrics = {}
-                for key, value in throughput.compute().items():
-                    metrics[f"train/{key}"] = value
-                metrics["train/loss"] = loss_item
-                metrics["train/learning_rate"] = optimizer.param_groups[0]["lr"]
-                wandb.log(metrics, step=step_count, commit=True)
+                if update_step % training_config.val_log_step_interval == 0:
+                    val_loss = validate(fabric, model, tokenizer, val_dl)
+                    if fabric.local_rank == 0:
+                        metrics = {}
+                        metrics["val/loss"] = val_loss.item()  # type: ignore
+                        wandb.log(metrics, step=iter_num, commit=True)
 
             iter_num += 1
+            if fabric.local_rank == 0:
+                running_loss.update(loss.detach())
+
+                metrics = {}
+                metrics["train/loss"] = running_loss.compute().item()
+                metrics["train/learning_rate"] = optimizer.param_groups[0]["lr"]
+                metrics["train/update_step"] = update_step
+                metrics["train/epoch"] = epoch
+                metrics["train/tokens"] = (
+                    iter_num
+                    * training_config.micro_batch_size
+                    * model.config.block_size
+                    * fabric.world_size
+                )
+                metrics["train/iter_time"] = time.perf_counter() - iter_t_start
+                metrics["train/percent_done"] = 100 * iter_num / total_iters
+                wandb.log(metrics, step=iter_num, commit=True)
+
+                inner_pbar.update(1)  # type: ignore
+                inner_pbar.set_description(  # type: ignore
+                    f"loss {metrics['train/loss']:.4f} epoch {epoch + 1}/{training_config.num_epochs} step {update_step}/{total_steps} accumulating {is_accumulating}"
+                )
+            fabric.barrier()
+
     if fabric.local_rank == 0:
         wandb.finish()
         inner_pbar.close()  # type: ignore
+
+    save_path = os.path.join(run_dir, "model.pt")
+    fabric.print(f"Saving model to {save_path}")
+    fabric.save(save_path, {"model": model})
+
+
+@torch.no_grad()
+def validate(
+    fabric: L.Fabric,
+    model: SLM,
+    tokenizer: HFTokenizer,
+    valid_dl: DataLoader | None = None,
+):
+    if valid_dl is None:
+        return
+
+    def mapping_func(example):
+        messages = example["messages"]
+        if messages[0]["role"] != "system":
+            messages.insert(0, {"role": "system", "content": ""})
+
+        return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
+
+    total_steps = len(valid_dl)
+
+    model.eval()
+    losses = torch.zeros(len(valid_dl), device=fabric.device)
+
+    inner_pbar = None
+    if fabric.local_rank == 0:
+        inner_pbar = tqdm(
+            range(total_steps),
+            colour="yellow",
+        )
+
+    for i, (input_ids, attn_mask) in enumerate(valid_dl):
+        x = input_ids[:, :-1]
+        x = fabric.to_device(x.pin_memory())
+
+        y = input_ids[:, 1:]
+        y = y.reshape(-1)
+        y = fabric.to_device(y.pin_memory())
+
+        mask = attn_mask[:, 1:]
+        mask = mask.reshape(-1).bool()
+        mask = fabric.to_device(mask.pin_memory())
+
+        logits = model(x)
+
+        logits = logits.reshape(-1, logits.size(-1))
+        loss = loss_fn(logits, y, mask)
+
+        losses[i] = loss.detach().item()
+        if fabric.local_rank == 0:
+            inner_pbar.update(1)  # type: ignore
+            inner_pbar.set_description(  # type: ignore
+                f"Step {i + 1}/{total_steps}"
+            )
+
+    if fabric.local_rank == 0:
+        inner_pbar.close()  # type: ignore
+
+    loss = fabric.all_reduce(losses, reduce_op="sum")
+    fabric.barrier()
+    num = loss.sum()  # type: ignore
+    den = fabric.world_size * loss.size(0)  # type: ignore
+    loss = num / den
+
+    model.train()
+    return loss
 
 
 def main(fabric: L.Fabric, run_config: RunConfig):
@@ -302,15 +391,36 @@ def main(fabric: L.Fabric, run_config: RunConfig):
         micro_batch_size=_train_config.micro_batch_size,
     )
 
-    model = get_model(run_config.model_name, run_config.ckpt_dir, fabric)
+    val_dl = None
+    if _train_config.val_datasets is not None:
+        val_dl = configure_dataloaders(
+            _train_config.val_datasets,
+            run_config.cache_dir,
+            num_proc=run_config.num_proc,
+            shuffle=False,
+            tokenizer=tokenizer,
+            fabric=fabric,
+            micro_batch_size=_train_config.micro_batch_size,
+        )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=_train_config.learning_rate,
-        weight_decay=_train_config.weight_decay,
+    model = get_model(
+        run_config.model_name, run_config.ckpt_dir, run_config.run_dir, fabric
     )
+
+    if isinstance(_train_config.optimizer, AdamConfig):
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            **_train_config.optimizer.__dict__,
+        )
+    elif isinstance(_train_config.optimizer, AdamWConfig):
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            **_train_config.optimizer.__dict__,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {_train_config.optimizer}")
+
     optimizer = fabric.setup_optimizers(optimizer)
-    fabric.seed_everything(42)
 
     train(
         fabric=fabric,
@@ -318,11 +428,36 @@ def main(fabric: L.Fabric, run_config: RunConfig):
         model=model,  # type: ignore
         optimizer=optimizer,  # type: ignore
         train_dl=train_dl,
-        valid_dl=None,
+        val_dl=val_dl,
         run_dir=run_config.run_dir,
         run_name=run_config.run_name,
+        tokenizer=tokenizer,
     )
 
 
 if __name__ == "__main__":
-    CLI(setup)
+    torch.set_float32_matmul_precision("high")
+
+    parser = ArgumentParser()
+    parser.add_argument("--model_name", type=str)
+    parser.add_argument("--train_config", type=str)
+    parser.add_argument(
+        "--cache_dir", type=str, default="/workspace/downloads/huggingface"
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        type=str,
+        default="/workspace/concepts/LLMs/microsoft/phi/checkpoints",
+    )
+    parser.add_argument(
+        "--experiment_dir",
+        type=str,
+        default="/workspace/concepts/LLMs/microsoft/phi/experiments",
+    )
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--num_proc", type=int, default=32)
+    parser.add_argument("--num_devices", type=int, default=1)
+    parser.add_argument("--precision", type=str, default="bf16-mixed")
+    parser.add_argument("--config", action=ActionConfigFile)
+
+    setup(parser)

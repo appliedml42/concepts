@@ -28,6 +28,18 @@ class SLM(nn.Module):
     def max_seq_length(self) -> int:
         return self._max_seq_length
 
+    def reset_parameters(self) -> None:
+        self.max_seq_length = self.config.block_size
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """Meant to be used with `gpt.apply(gpt._init_weights)`."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     @max_seq_length.setter
     def max_seq_length(self, value: int) -> None:
         self._max_seq_length = value
